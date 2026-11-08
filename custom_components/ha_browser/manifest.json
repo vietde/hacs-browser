@@ -1,0 +1,1 @@
+{"codeowners":[],"config_flow":true,"dependencies":["frontend"],"documentation":"https://github.com/vietde/hacs-browser","domain":"ha_browser","integration_type":"service","iot_class":"cloud_polling","name":"HA Browser","requirements":[],"version":"0.1.0"}
