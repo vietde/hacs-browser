@@ -300,11 +300,19 @@ def is_forbidden_target(url: str) -> bool:
     return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
 
 
-def proxy_url_for(target: str, base_url: str | None = None) -> str | None:
+def proxy_url_for(target: str, base_url: str | None = None, signer=None) -> str | None:
     """Wrap a page-relative or absolute URL as a proxy URL.
 
     Returns None when the URL is unusable (javascript:, mailto:,
     fragment-only) or points at a blocked ad/tracker domain.
+
+    `signer`, when given, is a callable taking a proxy URL and
+    returning the same URL with a valid HA auth signature appended
+    (or None on failure). Signed URLs are required: the browser
+    panel and the proxied pages load through plain iframe
+    navigations, which carry no Authorization header, so an
+    unsigned proxy URL answers 401 (see views.py). A signer that
+    fails or returns None falls back to the unsigned URL.
     """
     if not target:
         return None
@@ -314,10 +322,18 @@ def proxy_url_for(target: str, base_url: str | None = None) -> str | None:
     absolute = urljoin(base_url, target) if base_url else target
     if is_blocked_url(absolute):
         return None
-    return f"{PROXY_PATH}?url={quote(absolute, safe='')}"
+    url = f"{PROXY_PATH}?url={quote(absolute, safe='')}"
+    if signer is not None:
+        try:
+            signed = signer(url)
+        except Exception:
+            signed = None
+        if signed:
+            return signed
+    return url
 
 
-def proxy_url_for_srcset(srcset: str, base_url: str | None) -> str:
+def proxy_url_for_srcset(srcset: str, base_url: str | None, signer=None) -> str:
     """Rewrite every URL inside a srcset attribute through the proxy."""
     parts = []
     for chunk in srcset.split(","):
@@ -325,7 +341,7 @@ def proxy_url_for_srcset(srcset: str, base_url: str | None) -> str:
         if not chunk:
             continue
         bits = chunk.split()
-        proxied = proxy_url_for(bits[0], base_url)
+        proxied = proxy_url_for(bits[0], base_url, signer)
         if proxied is None:
             continue
         parts.append(proxied + (" " + " ".join(bits[1:]) if len(bits) > 1 else ""))
@@ -340,7 +356,7 @@ def strip_headers(headers) -> dict:
 _CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)([^)'\"]+)\1\s*\)", re.I)
 
 
-def rewrite_css(css: str, base_url: str) -> tuple[str, int]:
+def rewrite_css(css: str, base_url: str, signer=None) -> tuple[str, int]:
     """Rewrite url(...) references in a stylesheet through the proxy.
 
     Returns (rewritten_css, blocked_count).
@@ -350,7 +366,7 @@ def rewrite_css(css: str, base_url: str) -> tuple[str, int]:
     def _repl(match: re.Match) -> str:
         nonlocal blocked
         quote_char, raw = match.group(1), match.group(2)
-        proxied = proxy_url_for(raw, base_url)
+        proxied = proxy_url_for(raw, base_url, signer)
         if proxied is None:
             blocked += 1
             return "url(about:blank)"
@@ -393,12 +409,23 @@ def _shim_script(blocked_domains: frozenset, server_blocked: int) -> str:
 class _Rewriter(HTMLParser):
     """Rewrite a page's URLs through the proxy and strip ads."""
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, signer=None):
         super().__init__(convert_charrefs=False)
         self.base_url = base_url
+        self.signer = signer
         self.out: list[str] = []
         self.blocked = 0
         self._skip_depth = 0  # >0 while inside a removed element
+
+    def _sign(self, proxy_url: str) -> str:
+        """Append an HA auth signature to a proxy URL, or return it as-is."""
+        if self.signer is None:
+            return proxy_url
+        try:
+            signed = self.signer(proxy_url)
+        except Exception:
+            signed = None
+        return signed or proxy_url
 
     # -- helpers ------------------------------------------------------
     def _is_ad_element(self, attrs: dict) -> bool:
@@ -415,7 +442,7 @@ class _Rewriter(HTMLParser):
                 out.append((name, None))
                 continue
             if name in ("href", "src", "action", "poster", "data", "cite"):
-                proxied = proxy_url_for(value, self.base_url)
+                proxied = proxy_url_for(value, self.base_url, self.signer)
                 if proxied is None:
                     if tag in ("script", "iframe", "img", "link", "source", "video", "audio", "embed", "track", "object"):
                         # Blocked resource: drop the whole tag. The
@@ -427,14 +454,15 @@ class _Rewriter(HTMLParser):
                     # navigating the iframe straight to the ad site.
                     absolute = urljoin(self.base_url, value)
                     if is_blocked_url(absolute):
-                        out.append((name, f"{PROXY_PATH}?url={quote(absolute, safe='')}"))
+                        out.append((name, self._sign(
+                            f"{PROXY_PATH}?url={quote(absolute, safe='')}")))
                     else:
                         # javascript:/mailto:/#fragment — leave alone.
                         out.append((name, value))
                 else:
                     out.append((name, proxied))
             elif name == "srcset":
-                rewritten = proxy_url_for_srcset(value, self.base_url)
+                rewritten = proxy_url_for_srcset(value, self.base_url, self.signer)
                 out.append((name, rewritten))
             else:
                 out.append((name, value))
@@ -510,13 +538,13 @@ class _Rewriter(HTMLParser):
         return f"<{tag}{text}{' /' if close else ''}>"
 
 
-def rewrite_html(html: str, base_url: str) -> tuple[str, int]:
+def rewrite_html(html: str, base_url: str, signer=None) -> tuple[str, int]:
     """Rewrite a page through the proxy and inject the adblock shim.
 
     Returns (rewritten_html, blocked_count) where blocked_count is the
     number of resources/elements removed server-side.
     """
-    parser = _Rewriter(base_url)
+    parser = _Rewriter(base_url, signer)
     try:
         parser.feed(html)
         parser.close()

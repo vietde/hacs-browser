@@ -30,6 +30,10 @@ CPU/memory cost the way an add-on has.
   important in it — the browser has its own cookie jar, but login
   flows through a proxy are unreliable and the session is shared
   with every admin who opens the panel.
+- **Forms that POST do not work through the proxy.** Signed URLs
+  only authenticate GET requests, so a form submit answers 401.
+  Search boxes that submit with GET work; login and checkout forms
+  do not.
 - **Not uBlock-level.** The blocklist is a curated list of ad and
   tracker domains plus ad-slot removal — good coverage, but not the
   full EasyList cosmetic filtering of a real adblocker.
@@ -56,5 +60,13 @@ CPU/memory cost the way an add-on has.
 
 ## Status
 
-v0.1.0 — first version. Proxy + adblock core tested offline;
-live verification on a real Home Assistant install is still pending.
+v0.1.1 — fixes the 401 the sidebar showed in v0.1.0. Home Assistant
+only accepts a Bearer header or a signed `?authSig=` query parameter
+(no cookie auth), and a plain iframe navigation sends neither — so
+v0.1.0's iframe panel never loaded the browser page at all. The
+panel is now a custom element (like HA Terminal) that signs every
+proxy URL with the `auth/sign_path` websocket command, and the proxy
+signs every URL it rewrites inside a page the same way, so images,
+stylesheets and scripts load too. The browser chrome is now a real
+omnibox-style address bar with a loading bar. Live verification on
+a real Home Assistant install is still pending.
