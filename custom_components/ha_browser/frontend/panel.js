@@ -370,6 +370,32 @@ class HABrowserPanel extends HTMLElement {
     if (data.type === "ha-browser-blocked" && this._blockedPill) {
       const n = data.count || 0;
       this._blockedPill.textContent = "\uD83D\uDEAB " + n + " blocked";
+      return;
+    }
+    // The injected shim cannot sign proxy/relay URLs itself — signing
+    // needs the HA connection, which only this panel has. It asks
+    // here; the reply goes back to the frame that asked (ev.source),
+    // or to the panel's own iframe when the source is unavailable.
+    if (data.type === "ha-browser-sign" && typeof data.id !== "undefined" && data.path) {
+      const replyTo = ev.source || (this._frame && this._frame.contentWindow);
+      this._sign(data.path).then(
+        (signed) => {
+          try {
+            replyTo.postMessage(
+              { type: "ha-browser-signed", id: data.id, signed: signed },
+              window.location.origin
+            );
+          } catch (e) { /* frame gone */ }
+        },
+        () => {
+          try {
+            replyTo.postMessage(
+              { type: "ha-browser-sign-error", id: data.id },
+              window.location.origin
+            );
+          } catch (e) { /* frame gone */ }
+        }
+      );
     }
   }
 }

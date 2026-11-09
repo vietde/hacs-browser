@@ -34,6 +34,7 @@ from html.parser import HTMLParser
 from urllib.parse import quote, unquote, urljoin, urlparse
 
 PROXY_PATH = "/api/ha_browser/proxy"
+WS_RELAY_PATH = "/api/ha_browser/ws"
 MAX_BODY_BYTES = 10 * 1024 * 1024  # never proxy more than 10 MB at once
 
 # ---------------------------------------------------------------------------
@@ -281,23 +282,40 @@ def is_blocked_url(url: str) -> bool:
 def is_forbidden_target(url: str) -> bool:
     """True for URLs the proxy must never fetch (SSRF guard).
 
-    Blocks non-http(s) schemes, localhost/loopback/link-local/private
-    IP literals and .local hosts. The browser is for the public web.
+    Blocks non-http(s) schemes, localhost, loopback, link-local and
+    reserved addresses. Private LAN addresses (RFC1918) and `.local`
+    hosts are ALLOWED since v0.2.0: browsing internal resources
+    (router, NAS, Node-RED, dashboards) is the point of the browser,
+    and the proxy is admin-only behind signed HA URLs — the same
+    access control hass_ingress relies on. The terminal integration
+    already gives an admin a shell with full LAN access, so blocking
+    the LAN here would add no safety for this household.
     """
     try:
         parsed = urlparse(url)
     except ValueError:
         return True
-    if parsed.scheme not in ("http", "https"):
+    if parsed.scheme not in ("http", "https", "ws", "wss"):
         return True
     host = (parsed.hostname or "").lower()
-    if not host or host in ("localhost",) or host.endswith(".local"):
+    if not host or host in ("localhost",):
         return True
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    return ip.is_loopback or ip.is_link_local or ip.is_reserved
+
+
+def is_internal_target(url: str) -> bool:
+    """True when a URL points at a LAN service (private IP / .local)."""
+    host = host_of(url) or ""
+    if host.endswith(".local"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_private
+    except ValueError:
+        return False
 
 
 def proxy_url_for(target: str, base_url: str | None = None, signer=None) -> str | None:
@@ -348,12 +366,80 @@ def proxy_url_for_srcset(srcset: str, base_url: str | None, signer=None) -> str:
     return ", ".join(parts)
 
 
-def strip_headers(headers) -> dict:
+def ws_relay_url_for(target: str, base_url: str | None = None, signer=None) -> str | None:
+    """Wrap a ws(s):// URL as a websocket-relay URL (unsigned unless signed).
+
+    Returns None for unusable URLs. The relay itself is a GET with an
+    Upgrade header, so a signed relay URL authenticates like any other
+    signed proxy URL — but the shim cannot sign synchronously, so it
+    asks the panel to sign (see _shim_script) instead of using this
+    for live pages. This helper is for tests and for any server-side
+    use; the live path goes through the panel.
+    """
+    if not target:
+        return None
+    target = target.strip()
+    if not target:
+        return None
+    if "://" in target:
+        absolute = target
+    else:
+        # Relative WS path: resolve against the base page with its
+        # scheme converted http->ws / https->wss.
+        try:
+            parsed_base = urlparse(base_url or "")
+        except ValueError:
+            return None
+        ws_scheme = {"http": "ws", "https": "wss"}.get(parsed_base.scheme)
+        if not ws_scheme:
+            return None
+        absolute = urljoin(parsed_base._replace(scheme=ws_scheme).geturl(), target)
+    try:
+        scheme = urlparse(absolute).scheme
+    except ValueError:
+        return None
+    if scheme not in ("ws", "wss"):
+        return None
+    if is_forbidden_target(absolute):
+        return None
+    url = f"{WS_RELAY_PATH}?url={quote(absolute, safe='')}"
+    if signer is not None:
+        try:
+            signed = signer(url)
+        except Exception:
+            signed = None
+        if signed:
+            return signed
+    return url
+
+
+def extract_ws_target(raw: str | None) -> str | None:
+    """Decode and validate the ?url= query value of a relay request."""
+    if not raw:
+        return None
+    try:
+        target = unquote(raw)
+    except Exception:
+        return None
+    try:
+        scheme = urlparse(target).scheme
+    except ValueError:
+        return None
+    if scheme not in ("ws", "wss"):
+        return None
+    if is_forbidden_target(target):
+        return None
+    return target
     """Drop framing/CSP headers; keep everything else."""
     return {k: v for k, v in headers.items() if k.lower() not in STRIP_HEADERS}
 
 
 _CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)([^)'\"]+)\1\s*\)", re.I)
+
+
+def strip_headers(headers) -> dict:
+    """Drop framing/CSP headers; keep everything else."""
+    return {k: v for k, v in headers.items() if k.lower() not in STRIP_HEADERS}
 
 
 def rewrite_css(css: str, base_url: str, signer=None) -> tuple[str, int]:
@@ -375,28 +461,153 @@ def rewrite_css(css: str, base_url: str, signer=None) -> tuple[str, int]:
     return _CSS_URL_RE.sub(_repl, css), blocked
 
 
-def _shim_script(blocked_domains: frozenset, server_blocked: int) -> str:
-    """Client-side adblock shim, injected into every proxied HTML page.
+def _shim_script(blocked_domains: frozenset, server_blocked: int, base_url: str) -> str:
+    """Client-side shim, injected into every proxied HTML page.
 
-    Wraps fetch/XHR and watches for dynamically added tags so ads the
-    page loads on its own (not through a rewritten tag) are blocked
-    too. Reports the running blocked count to the browser bar.
+    Three jobs, in order of importance for internal apps:
+    1. Route the page's own requests through the proxy. The page is
+       served from Home Assistant's origin, so a relative fetch/XHR/
+       WebSocket URL would otherwise hit Home Assistant itself
+       instead of the site it came from. Every such request is
+       resolved against the page's ORIGINAL base URL and routed
+       through the proxy — and because proxy URLs must be signed,
+       the shim asks the sidebar panel to sign them (the panel owns
+       the HA connection; the page cannot sign for itself). The panel
+       answers with ha-browser-signed / ha-browser-sign-error.
+    2. Block ads/trackers the page loads on its own (fetch/XHR/
+       dynamic tags) and report the running blocked count to the
+       browser bar.
+    3. Make XMLHttpRequest work through the proxy at all: the shim
+       replaces it with a fetch-backed implementation, because a
+       native XHR cannot wait for a signature. Async only — sync XHR
+       is deprecated and throws.
     """
     domains_json = json.dumps(sorted(blocked_domains))
+    base_json = json.dumps(base_url)
+    proxy_json = json.dumps(PROXY_PATH)
+    relay_json = json.dumps(WS_RELAY_PATH)
     return (
         "<script>(function(){"
         "var BLOCKED=" + domains_json + ";"
+        "var BASE=" + base_json + ";"
+        "var PROXY=" + proxy_json + ";"
+        "var WSRELAY=" + relay_json + ";"
         f"var count={server_blocked};"
+        # --- adblock helpers
         "function blocked(u){try{var h=new URL(u,location.href).hostname.toLowerCase();"
         "for(var i=0;i<BLOCKED.length;i++){if(h===BLOCKED[i]||h.endsWith('.'+BLOCKED[i]))return true;}"
         "}catch(e){}return false;}"
         "function report(){try{window.parent.postMessage({type:'ha-browser-blocked',count:count},location.origin);}catch(e){}}"
+        # --- signing: ask the sidebar panel (it owns the HA connection)
+        "var _seq=0;var _pending={};"
+        "function sign(path){return new Promise(function(res,rej){"
+        "if(window.parent===window){rej(new Error('no panel'));return;}"
+        "var id=++_seq;var done=false;"
+        "var timer=setTimeout(function(){if(!done){done=true;delete _pending[id];rej(new Error('sign timeout'));}},5000);"
+        "_pending[id]={res:function(v){if(!done){done=true;clearTimeout(timer);res(v);}},"
+        "rej:function(e){if(!done){done=true;clearTimeout(timer);rej(e);}}};"
+        "try{window.parent.postMessage({type:'ha-browser-sign',id:id,path:path},location.origin);}"
+        "catch(e){delete _pending[id];clearTimeout(timer);rej(e);}});}"
+        "window.addEventListener('message',function(ev){if(ev.origin!==location.origin)return;"
+        "var d=ev.data||{};"
+        "if(d.type==='ha-browser-signed'&&_pending[d.id])_pending[d.id].res(d.signed);"
+        "else if(d.type==='ha-browser-sign-error'&&_pending[d.id])_pending[d.id].rej(new Error('sign failed'));});"
+        # --- URL routing: proxy/HA URLs pass through, the rest resolve
+        # against the page's ORIGINAL base and go through the proxy.
+        "function isProxyPath(u){return typeof u==='string'&&(u.indexOf(PROXY)===0||u.indexOf(WSRELAY)===0);}"
+        "function resolve(u){if(isProxyPath(u))return u;"
+        "try{return new URL(u,BASE).href;}catch(e){return null;}}"
+        "function sameOrigin(u){try{return new URL(u,location.href).origin===location.origin;}catch(e){return false;}}"
+        "function proxyFor(abs){return PROXY+'?url='+encodeURIComponent(abs);}"
+        # --- fetch
         "var ofetch=window.fetch.bind(window);"
-        "window.fetch=function(u){if(blocked(u)){count++;report();return Promise.reject(new Error('blocked by HA Browser'));}"
-        "return ofetch.apply(null,arguments);};"
-        "var oopen=XMLHttpRequest.prototype.open;"
-        "XMLHttpRequest.prototype.open=function(m,u){if(blocked(u)){count++;report();throw new Error('blocked by HA Browser');}"
-        "return oopen.apply(this,arguments);};"
+        "window.fetch=function(input,init){"
+        "var raw=typeof input==='string'?input:(input&&input.url);"
+        "var abs=resolve(raw);if(!abs)return ofetch.apply(null,arguments);"
+        "if(isProxyPath(abs)||sameOrigin(abs))return ofetch.apply(null,arguments);"
+        "if(blocked(abs)){count++;report();return Promise.reject(new Error('blocked by HA Browser'));}"
+        "return sign(proxyFor(abs)).then(function(signed){"
+        "if(typeof input==='string')return ofetch(signed,init);"
+        "try{return ofetch(new Request(signed,input));}catch(e){return ofetch(signed,init);}"
+        "}).catch(function(){return ofetch.apply(null,arguments);});};"
+        # --- XMLHttpRequest, fetch-backed so it can wait for a signature
+        "var NativeXHR=window.XMLHttpRequest;"
+        "function FakeXHR(){this._headers={};this.readyState=0;this.status=0;this.statusText='';"
+        "this.responseText='';this.response='';this.responseType='';this._aborted=false;"
+        "this.onreadystatechange=null;this.onload=null;this.onerror=null;this._listeners={};}"
+        "FakeXHR.prototype.open=function(method,url,async){"
+        "if(async===false)throw new Error('Synchronous XHR is not supported by HA Browser');"
+        "this._method=method;this._url=url;this.readyState=1;this._fire('readystatechange');};"
+        "FakeXHR.prototype.setRequestHeader=function(k,v){this._headers[k]=v;};"
+        "FakeXHR.prototype.getResponseHeader=function(){return null;};"
+        "FakeXHR.prototype.getAllResponseHeaders=function(){return '';};"
+        "FakeXHR.prototype.addEventListener=function(t,fn){(this._listeners[t]=this._listeners[t]||[]).push(fn);};"
+        "FakeXHR.prototype.removeEventListener=function(t,fn){var a=this._listeners[t]||[];var i=a.indexOf(fn);if(i>=0)a.splice(i,1);};"
+        "FakeXHR.prototype._fire=function(t,ev){var h=this['on'+t];"
+        "if(typeof h==='function'){try{h.call(this,ev||{});}catch(e){}}"
+        "var self=this;(this._listeners[t]||[]).forEach(function(fn){try{fn.call(self,ev||{});}catch(e){}});};"
+        "FakeXHR.prototype.abort=function(){this._aborted=true;this.readyState=0;};"
+        "FakeXHR.prototype.send=function(body){var self=this;"
+        "function fail(){if(self._aborted)return;self.readyState=4;self.status=0;"
+        "self._fire('readystatechange');self._fire('error');}"
+        "var abs=resolve(self._url);if(!abs){fail();return;}"
+        "if(isProxyPath(abs)||sameOrigin(abs)){doFetch(abs);return;}"
+        "if(blocked(abs)){count++;report();fail();return;}"
+        "sign(proxyFor(abs)).then(doFetch,function(){doFetch(abs);});"
+        "function doFetch(url){if(self._aborted)return;"
+        "var headers=new Headers();for(var k in self._headers)headers.append(k,self._headers[k]);"
+        "ofetch(url,{method:self._method,headers:headers,body:(body===undefined?null:body)}).then(function(resp){"
+        "if(self._aborted)return;self.status=resp.status;self.statusText=resp.statusText;"
+        "self.readyState=2;self._fire('readystatechange');"
+        "if(self.responseType==='json')return resp.text().then(function(t){try{return JSON.parse(t);}catch(e){return t;}});"
+        "return resp.text();}).then(function(data){if(self._aborted)return;"
+        "if(typeof data==='string'){self.responseText=data;self.response=data;}"
+        "else{self.response=data;self.responseText='';}"
+        "self.readyState=4;self._fire('readystatechange');self._fire('load');}).catch(fail);}};"
+        "window.XMLHttpRequest=FakeXHR;"
+        # --- WebSocket: deferred until the panel signs the relay URL
+        "var NativeWS=window.WebSocket;"
+        "function DeferredWS(url,protocols){var self=this;"
+        "this.url=url;this.protocol='';this._binaryType='blob';this.readyState=0;this.bufferedAmount=0;"
+        "this.onopen=null;this.onmessage=null;this.onclose=null;this.onerror=null;"
+        "this._listeners={};this._queue=[];this._real=null;this._closed=false;"
+        "var abs=resolve(url);"
+        "function fail(){self.readyState=3;self._fire('error',{});self._fire('close',{code:1006,wasClean:false});}"
+        "if(!abs){setTimeout(fail,0);return;}"
+        "if(blocked(abs)){count++;report();setTimeout(fail,0);return;}"
+        "if(isProxyPath(abs)||sameOrigin(abs)){connect(abs);return;}"
+        "sign(WSRELAY+'?url='+encodeURIComponent(abs)).then(connect,function(){fail();});"
+        "function connect(target){if(self._closed)return;var real;"
+        "try{real=new NativeWS(target,protocols);}catch(e){fail();return;}"
+        "self._real=real;try{real.binaryType=self.binaryType;}catch(e){}"
+        "real.onopen=function(ev){self.readyState=1;try{self.protocol=real.protocol||'';}catch(e){}"
+        "self._fire('open',ev);var q=self._queue;self._queue=[];"
+        "q.forEach(function(d){try{real.send(d);}catch(e){}});};"
+        "real.onmessage=function(ev){self._fire('message',ev);};"
+        "real.onclose=function(ev){self.readyState=3;self._fire('close',ev);};"
+        "real.onerror=function(ev){self._fire('error',ev);};}}"
+        "DeferredWS.prototype._fire=function(t,ev){var h=this['on'+t];"
+        "if(typeof h==='function'){try{h.call(this,ev||{});}catch(e){}}"
+        "var self=this;(this._listeners[t]||[]).forEach(function(fn){try{fn.call(self,ev||{});}catch(e){}});};"
+        "DeferredWS.prototype.send=function(data){"
+        "if(this.readyState===3)throw new Error('WebSocket is closed');"
+        "if(this._real&&this.readyState===1){this._real.send(data);return;}"
+        "this._queue.push(data);};"
+        "DeferredWS.prototype.close=function(code,reason){this._closed=true;"
+        "if(this._real){try{this._real.close(code,reason);}catch(e){}}"
+        "else{this.readyState=3;var self=this;"
+        "setTimeout(function(){self._fire('close',{code:code||1000,wasClean:true});},0);}};"
+        "DeferredWS.prototype.addEventListener=function(t,fn){(this._listeners[t]=this._listeners[t]||[]).push(fn);};"
+        "DeferredWS.prototype.removeEventListener=function(t,fn){var a=this._listeners[t]||[];var i=a.indexOf(fn);if(i>=0)a.splice(i,1);};"
+        "Object.defineProperty(DeferredWS.prototype,'binaryType',{"
+        "get:function(){return this._binaryType||'blob';},"
+        "set:function(v){this._binaryType=v;if(this._real){try{this._real.binaryType=v;}catch(e){}}},"
+        "configurable:true});"
+        "DeferredWS.CONNECTING=0;DeferredWS.OPEN=1;DeferredWS.CLOSING=2;DeferredWS.CLOSED=3;"
+        "DeferredWS.prototype.CONNECTING=0;DeferredWS.prototype.OPEN=1;"
+        "DeferredWS.prototype.CLOSING=2;DeferredWS.prototype.CLOSED=3;"
+        "window.WebSocket=DeferredWS;"
+        # --- dynamic tags: drop blocked ones as they appear
         "var mo=new MutationObserver(function(){"
         "document.querySelectorAll('img,script,iframe,link').forEach(function(el){"
         "var s=el.src||el.href||'';if(s&&blocked(s)){count++;el.remove();}});});"
@@ -551,9 +762,9 @@ def rewrite_html(html: str, base_url: str, signer=None) -> tuple[str, int]:
     except Exception:
         # A malformed page must not kill the browser: fall back to the
         # original HTML with only the shim injected.
-        return html + _shim_script(BLOCKED_DOMAINS, 0), 0
+        return html + _shim_script(BLOCKED_DOMAINS, 0, base_url), 0
     body = "".join(parser.out)
-    shim = _shim_script(BLOCKED_DOMAINS, parser.blocked)
+    shim = _shim_script(BLOCKED_DOMAINS, parser.blocked, base_url)
     if "</body>" in body.lower():
         idx = body.lower().rindex("</body>")
         body = body[:idx] + shim + body[idx:]
@@ -569,6 +780,12 @@ def extract_target(raw: str | None) -> str | None:
     try:
         target = unquote(raw)
     except Exception:
+        return None
+    try:
+        scheme = urlparse(target).scheme
+    except ValueError:
+        return None
+    if scheme not in ("http", "https"):
         return None
     if is_forbidden_target(target):
         return None

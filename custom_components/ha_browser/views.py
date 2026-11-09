@@ -8,7 +8,17 @@
 * ProxyView         — fetches a target page server-side, strips the
   framing headers, rewrites it through the proxy and applies the
   adblocker. Admin-only: it makes Home Assistant fetch arbitrary
-  public URLs, so it must never be open to non-admin users.
+  URLs, so it must never be open to non-admin users. Since v0.2.0
+  the target may be a LAN service (private IP / .local) — that is
+  the point of the browser now (ingress-style internal browsing);
+  localhost/loopback/link-local stay blocked.
+* BrowserWebSocketView — relays a websocket between a proxied page
+  and its target (Node-RED, Frigate, router UIs and most dashboards
+  need one). Same admin + signed-URL gate; the handshake is a GET,
+  so a signed relay URL authenticates. Pattern copied from
+  hass_ingress (lovelylain/hass_ingress): prepare the server socket
+  with the client's subprotocols, connect to the target, forward
+  both directions until one side closes.
 
 Auth design (v0.1.1 — this is what v0.1.0 got wrong)
 ----------------------------------------------------
@@ -40,15 +50,23 @@ from datetime import timedelta
 from pathlib import Path
 
 import aiohttp
-from aiohttp import web
+from aiohttp import WSMsgType, web
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.components.http.auth import async_sign_path
 from homeassistant.components.http.const import KEY_HASS_REFRESH_TOKEN_ID, KEY_HASS_USER
 from homeassistant.config_entries import ConfigEntry
 
 from . import proxy as browser_proxy
-from .const import CONF_ADBLOCK, CONF_HOMEPAGE, DEFAULT_ADBLOCK, DEFAULT_HOMEPAGE, DOMAIN
-from .proxy import PROXY_PATH
+from .const import (
+    CONF_ADBLOCK,
+    CONF_HOMEPAGE,
+    CONF_VERIFY_TLS,
+    DEFAULT_ADBLOCK,
+    DEFAULT_HOMEPAGE,
+    DEFAULT_VERIFY_TLS,
+    DOMAIN,
+)
+from .proxy import PROXY_PATH, WS_RELAY_PATH
 
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 
@@ -71,6 +89,43 @@ div{text-align:center}h1{font-size:20px;margin:0 0 8px}p{color:#9aa3ab;margin:0}
 </style></head><body><div><h1>Blocked by HA Browser</h1>
 <p>This ad or tracker was blocked by the built-in adblocker.</p></div>
 </body></html>"""
+
+
+def _is_websocket(request: web.Request) -> bool:
+    """True when the request is a websocket handshake."""
+    headers = request.headers
+    return bool(
+        "upgrade" in headers.get("Connection", "").lower()
+        and headers.get("Upgrade", "").lower() == "websocket"
+    )
+
+
+async def _websocket_forward(ws_from, ws_to) -> None:
+    """Forward frames one way until that side closes or errors."""
+    try:
+        async for msg in ws_from:
+            if msg.type is WSMsgType.TEXT:
+                await ws_to.send_str(msg.data)
+            elif msg.type is WSMsgType.BINARY:
+                await ws_to.send_bytes(msg.data)
+            elif msg.type is WSMsgType.PING:
+                await ws_to.ping()
+            elif msg.type is WSMsgType.PONG:
+                await ws_to.pong()
+            elif msg.type is WSMsgType.CLOSE:
+                if not ws_to.closed:
+                    await ws_to.close(code=ws_to.close_code or 1000)
+                break
+            elif msg.type is WSMsgType.ERROR:
+                break
+    except (RuntimeError, ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        if not ws_to.closed:
+            try:
+                await ws_to.close()
+            except Exception:
+                pass
 
 
 def _is_admin(request: web.Request) -> bool:
@@ -176,12 +231,17 @@ class ProxyView(HomeAssistantView):
         session: aiohttp.ClientSession = request.app["hass"].data[DOMAIN][
             self._entry.entry_id
         ]["session"]
+        verify_tls = self._entry.options.get(CONF_VERIFY_TLS, DEFAULT_VERIFY_TLS)
         try:
             body = await request.read() if request.method == "POST" else None
             headers = {
                 k: v
                 for k, v in request.headers.items()
-                if k.lower() not in ("host", "content-length", "connection", "cookie")
+                # Never forward Home Assistant's own credentials to a
+                # target: the browser's Authorization header (HA Bearer
+                # token) must stay inside Home Assistant. Per-target
+                # login headers are a separate, future option.
+                if k.lower() not in ("host", "content-length", "connection", "cookie", "authorization")
             }
             async with session.request(
                 request.method,
@@ -191,6 +251,7 @@ class ProxyView(HomeAssistantView):
                 allow_redirects=True,
                 timeout=aiohttp.ClientTimeout(total=30),
                 max_redirects=5,
+                ssl=None if verify_tls else False,
             ) as resp:
                 # Capture everything needed before the response is released.
                 content_type = resp.headers.get("Content-Type", "")
@@ -246,3 +307,68 @@ class ProxyView(HomeAssistantView):
             content_type=content_type or "application/octet-stream",
             headers=headers,
         )
+
+
+class BrowserWebSocketView(HomeAssistantView):
+    """Relay a websocket between a proxied page and its target.
+
+    The page's injected shim asks the sidebar panel to sign the relay
+    URL first (a WebSocket constructor cannot wait for anything, so
+    the shim uses a deferred stand-in); the handshake itself is a
+    GET, so the signed URL authenticates exactly like a signed proxy
+    URL. Admin-only, like the rest of the proxy.
+    """
+
+    url = WS_RELAY_PATH
+    name = "api:ha_browser:ws"
+    requires_auth = True
+
+    def __init__(self, entry: ConfigEntry) -> None:
+        self._entry = entry
+
+    async def get(self, request: web.Request) -> web.Response:
+        if not _is_admin(request):
+            return web.Response(status=403, text="Admin only")
+        target = browser_proxy.extract_ws_target(request.query.get("url"))
+        if target is None:
+            return web.Response(status=400, text="Missing or invalid url")
+        if not _is_websocket(request):
+            return web.Response(status=400, text="Not a websocket request")
+
+        protocols = [
+            proto.strip()
+            for proto in request.headers.get("Sec-WebSocket-Protocol", "").split(",")
+            if proto.strip()
+        ]
+        ws_server = web.WebSocketResponse(
+            protocols=protocols, autoclose=False, autoping=False
+        )
+        await ws_server.prepare(request)
+
+        session: aiohttp.ClientSession = request.app["hass"].data[DOMAIN][
+            self._entry.entry_id
+        ]["session"]
+        verify_tls = self._entry.options.get(CONF_VERIFY_TLS, DEFAULT_VERIFY_TLS)
+        try:
+            async with session.ws_connect(
+                target,
+                ssl=None if verify_tls else False,
+                protocols=protocols,
+                autoclose=False,
+                autoping=False,
+                heartbeat=30,
+            ) as ws_client:
+                await asyncio.wait(
+                    [
+                        asyncio.create_task(_websocket_forward(ws_server, ws_client)),
+                        asyncio.create_task(_websocket_forward(ws_client, ws_server)),
+                    ],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            if not ws_server.closed:
+                try:
+                    await ws_server.close(code=1011, message=str(err).encode()[:120])
+                except Exception:
+                    pass
+        return ws_server

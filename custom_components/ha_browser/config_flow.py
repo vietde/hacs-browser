@@ -6,7 +6,15 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.helpers.selector import BooleanSelector, TextSelector
 
-from .const import CONF_ADBLOCK, CONF_HOMEPAGE, DEFAULT_ADBLOCK, DEFAULT_HOMEPAGE, DOMAIN
+from .const import (
+    CONF_ADBLOCK,
+    CONF_HOMEPAGE,
+    CONF_VERIFY_TLS,
+    DEFAULT_ADBLOCK,
+    DEFAULT_HOMEPAGE,
+    DEFAULT_VERIFY_TLS,
+    DOMAIN,
+)
 
 
 class HABrowserConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -24,6 +32,7 @@ class HABrowserConfigFlow(ConfigFlow, domain=DOMAIN):
                 options={
                     CONF_HOMEPAGE: user_input[CONF_HOMEPAGE],
                     CONF_ADBLOCK: user_input[CONF_ADBLOCK],
+                    CONF_VERIFY_TLS: user_input[CONF_VERIFY_TLS],
                 },
             )
         return self.async_show_form(
@@ -32,6 +41,7 @@ class HABrowserConfigFlow(ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(CONF_HOMEPAGE, default=DEFAULT_HOMEPAGE): TextSelector(),
                     vol.Required(CONF_ADBLOCK, default=DEFAULT_ADBLOCK): BooleanSelector(),
+                    vol.Required(CONF_VERIFY_TLS, default=DEFAULT_VERIFY_TLS): BooleanSelector(),
                 }
             ),
         )
@@ -59,6 +69,10 @@ class HABrowserOptionsFlow(OptionsFlow):
                     vol.Required(
                         CONF_ADBLOCK,
                         default=options.get(CONF_ADBLOCK, DEFAULT_ADBLOCK),
+                    ): BooleanSelector(),
+                    vol.Required(
+                        CONF_VERIFY_TLS,
+                        default=options.get(CONF_VERIFY_TLS, DEFAULT_VERIFY_TLS),
                     ): BooleanSelector(),
                 }
             ),

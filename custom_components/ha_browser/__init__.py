@@ -24,20 +24,21 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 from .const import DOMAIN, PANEL_ICON, PANEL_TITLE, PANEL_URL_PATH
-from .views import AssetView, BrowserConfigView, ProxyView
+from .views import AssetView, BrowserConfigView, BrowserWebSocketView, ProxyView
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up HA Browser from a config entry."""
     session = async_create_clientsession(
         hass,
-        headers={"User-Agent": "HA-Browser/0.1.1 (Home Assistant)"},
+        headers={"User-Agent": "HA-Browser/0.2.0 (Home Assistant)"},
     )
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"session": session}
 
     hass.http.register_view(AssetView())
     hass.http.register_view(BrowserConfigView(entry))
     hass.http.register_view(ProxyView(entry))
+    hass.http.register_view(BrowserWebSocketView(entry))
     await panel_custom.async_register_panel(
         hass,
         PANEL_URL_PATH,
