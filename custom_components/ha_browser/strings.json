@@ -1,0 +1,56 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "HA Browser",
+        "description": "A tabbed browser panel that proxies pages through Home Assistant. Anything you allow here can be fetched *by your HA server*, so keep admin-only on unless you trust every user.",
+        "data": {
+          "title": "Sidebar title",
+          "icon": "Sidebar icon",
+          "require_admin": "Admin only",
+          "home_url": "Home page URL (optional)",
+          "search_url": "Search URL (%s = query)",
+          "allow_private": "Allow private network (LAN) addresses",
+          "allow_public": "Allow public internet addresses",
+          "allow_loopback": "Allow loopback (127.0.0.1 / localhost)",
+          "allowed_hosts": "Allow list (one per line: hostnames with * wildcards, IPs or CIDRs). Empty = no restriction",
+          "blocked_hosts": "Block list (same format)",
+          "verify_ssl": "Verify HTTPS certificates",
+          "session_ttl": "Session idle timeout (minutes)"
+        }
+      }
+    },
+    "error": {
+      "invalid_url": "Must start with http:// or https://",
+      "invalid_search_url": "Must contain %s where the query goes"
+    },
+    "abort": {
+      "single_instance_allowed": "HA Browser is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "HA Browser settings",
+        "data": {
+          "title": "Sidebar title",
+          "icon": "Sidebar icon",
+          "require_admin": "Admin only",
+          "home_url": "Home page URL (optional)",
+          "search_url": "Search URL (%s = query)",
+          "allow_private": "Allow private network (LAN) addresses",
+          "allow_public": "Allow public internet addresses",
+          "allow_loopback": "Allow loopback (127.0.0.1 / localhost)",
+          "allowed_hosts": "Allow list (one per line: hostnames with * wildcards, IPs or CIDRs). Empty = no restriction",
+          "blocked_hosts": "Block list (same format)",
+          "verify_ssl": "Verify HTTPS certificates",
+          "session_ttl": "Session idle timeout (minutes)"
+        }
+      }
+    },
+    "error": {
+      "invalid_url": "Must start with http:// or https://",
+      "invalid_search_url": "Must contain %s where the query goes"
+    }
+  }
+}

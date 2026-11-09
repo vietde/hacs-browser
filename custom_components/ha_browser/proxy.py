@@ -1,820 +1,283 @@
-"""HA Browser — proxy + ad-blocking core.
+"""HTTP + WebSocket reverse proxy for HA Browser.
 
-Pure standard library, no Home Assistant imports, so it can be unit
-tested offline. The HA views (views.py) only fetch bytes and call
-these helpers.
-
-How the browser works
----------------------
-Most sites refuse to load inside an iframe (X-Frame-Options / CSP
-frame-ancestors), so the integration fetches pages server-side and
-serves them from Home Assistant's own origin. While doing that it:
-
-* strips the headers that forbid framing (X-Frame-Options, CSP),
-* rewrites every link, image, script, stylesheet, form and media URL
-  so the next click also goes through the proxy,
-* removes resources served from known ad/tracker domains,
-* removes whole page elements whose id/class looks like an ad slot,
-* injects a small script that blocks ad/tracker requests the page
-  makes on its own (fetch/XHR/dynamic tags) and reports how many
-  ads/trackers were blocked back to the browser bar.
-
-Limits, stated honestly (see README): JavaScript-heavy apps, sites
-that need a login, video streaming and websockets mostly do not work
-well through a simple proxy. This is a *light* browser for reading
-pages, news and docs — not a replacement for a desktop browser.
+Auth is the unguessable session token in the URL path (iframes cannot send
+bearer headers). Every response is served with a CSP ``sandbox`` directive so
+proxied content gets an opaque origin and can never read Home Assistant's
+storage or tokens, even when the URL is opened directly in a browser tab.
 """
-
 from __future__ import annotations
 
-import ipaddress
-import json
+import asyncio
+import html as html_lib
+import logging
 import re
-from html.parser import HTMLParser
-from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.parse import urlsplit
 
-PROXY_PATH = "/api/ha_browser/proxy"
-WS_RELAY_PATH = "/api/ha_browser/ws"
-MAX_BODY_BYTES = 10 * 1024 * 1024  # never proxy more than 10 MB at once
+import aiohttp
+from aiohttp import WSMsgType, web
+from yarl import URL
 
-# ---------------------------------------------------------------------------
-# Ad / tracker blocklist (curated, domain-suffix matching)
-# ---------------------------------------------------------------------------
-# Well-known ad networks, trackers and analytics. Subdomains match too
-# (ads.example.com is blocked when example.com is listed). The list is
-# deliberately conservative: only domains whose whole business is ads,
-# tracking or analytics, so ordinary content CDNs are never blocked.
-BLOCKED_DOMAINS = frozenset(
-    {
-        # Google ads / analytics
-        "doubleclick.net",
-        "googlesyndication.com",
-        "google-analytics.com",
-        "googletagmanager.com",
-        "googletagservices.com",
-        "googleadservices.com",
-        "analytics.google.com",
-        "ads.google.com",
-        "pagead2.googlesyndication.com",
-        "adservice.google.com",
-        "adservice.google.co.jp",
-        # Meta
-        "facebook.net",
-        "connect.facebook.net",
-        "graph.facebook.com",
-        # Amazon ads
-        "amazon-adsystem.com",
-        "aax.amazon-adsystem.com",
-        # Microsoft / LinkedIn ads
-        "ads.linkedin.com",
-        "bat.bing.com",
-        "clarity.ms",
-        # Ad networks
-        "taboola.com",
-        "outbrain.com",
-        "criteo.com",
-        "criteo.net",
-        "adnxs.com",
-        "adsrvr.org",
-        "rubiconproject.com",
-        "pubmatic.com",
-        "openx.net",
-        "moatads.com",
-        "adsafeprotected.com",
-        "scorecardresearch.com",
-        "quantserve.com",
-        "quantcast.com",
-        "advertising.com",
-        "adtechus.com",
-        "2mdn.net",
-        "casalemedia.com",
-        "bidswitch.net",
-        "lijit.com",
-        "mathtag.com",
-        "bluekai.com",
-        "krxd.net",
-        "demdex.net",
-        "everesttech.net",
-        "rlcdn.com",
-        "agkn.com",
-        "addthis.com",
-        "addthisedge.com",
-        "sharethis.com",
-        "taboolaapis.com",
-        "zedo.com",
-        "tribalfusion.com",
-        "adform.net",
-        "adroll.com",
-        "simpli.fi",
-        "spotxchange.com",
-        "spotx.tv",
-        "teads.tv",
-        "smartadserver.com",
-        "admixer.net",
-        "admatic.com.tr",
-        # Trackers / analytics / session replay
-        "hotjar.com",
-        "hotjar.io",
-        "mixpanel.com",
-        "segment.com",
-        "segment.io",
-        "fullstory.com",
-        "logrocket.com",
-        "amplitude.com",
-        "heap.io",
-        "mouseflow.com",
-        "crazyegg.com",
-        "luckyorange.com",
-        "inspectlet.com",
-        "smartlook.com",
-        "yandex.ru",  # yandex metrica
-        "mc.yandex.ru",
-        "metrika.yandex.ru",
-        "newrelic.com",
-        "nr-data.net",
-        "sentry.io",
-        "bugsnag.com",
-        "intercom.io",
-        "intercomcdn.com",
-        "drift.com",
-        "zendesk.com",
-        "zopim.com",
-        "optimizely.com",
-        "vwo.com",
-        "abtasty.com",
-        "clicktale.com",
-        "clicktale.net",
-        "contentsquare.net",
-        "piano.io",
-        "tinypass.com",
-        "chartbeat.com",
-        "chartbeat.net",
-        "parsely.com",
-        "pingdom.net",
-        "alexametrics.com",
-        "imrworldwide.com",
-        "nielsen.com",
-        "moat.com",
-        "doubleverify.com",
-        "iasds01.com",
-        "eyeota.net",
-        "lotame.com",
-        "exelator.com",
-        "turn.com",
-        "adobedtm.com",
-        "omtrdc.net",
-        "everestads.net",
-        "fwmrm.net",
-        "freewheel.tv",
-        "freewheel.com",
-        "innovid.com",
-        "flashtalking.com",
-        "sizmek.com",
-        "mediamath.com",
-        "thetradedesk.com",
-        "ads-twitter.com",
-        "analytics.twitter.com",
-        "ads.pinterest.com",
-        "ads.tiktok.com",
-        "analytics.tiktok.com",
-        "snap.licdn.com",
-        "px.ads.linkedin.com",
-        "trk.pinterest.com",
-        "ct.pinterest.com",
-        "analytics.yahoo.com",
-        "ads.yahoo.com",
-        "advertising.yahoo.com",
-        "amplify.outbrain.com",
-        "odb.outbrain.com",
-        "widgets.outbrain.com",
-        "recommendations.taboola.com",
-    }
+from homeassistant.components.http import HomeAssistantView
+from homeassistant.core import HomeAssistant
+
+from .const import CONF_REQUIRE_ADMIN, DOMAIN, MAX_REWRITE_BYTES, PROXY_BASE
+from .rewrite import Rewriter
+from .security import PolicyError
+
+_LOGGER = logging.getLogger(__name__)
+
+_SANDBOX = (
+    "sandbox allow-scripts allow-forms allow-popups allow-modals "
+    "allow-downloads allow-pointer-lock allow-presentation"
 )
-
-# Domains blocked only when the URL path looks ad-related.
-PATH_BLOCKED_DOMAINS = {
-    "gstatic.com": re.compile(r"/(ads|pagead|doubleclick)", re.I),
-    "google.com": re.compile(r"/(ads|pagead|doubleclick)", re.I),
-    "googleapis.com": re.compile(r"/(ads|pagead)", re.I),
-    "facebook.com": re.compile(r"/(tr|plugins/like)", re.I),
-    "youtube.com": re.compile(r"/(api/stats/ads|pagead)", re.I),
+_OUR_HEADERS = {
+    "Content-Security-Policy": _SANDBOX,
+    "Referrer-Policy": "no-referrer",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Expose-Headers": "*",
 }
 
-# Elements whose id or class looks like an ad slot are removed whole.
-AD_ELEMENT_RE = re.compile(
-    r"(^|[\s_\-])(ad|ads|advert|advertisement|sponsored|taboola|outbrain"
-    r"|popunder|popup-ad|sticky-ad|banner-ad)([\s_\-]|$)",
-    re.I,
-)
-
-# Response headers that must never reach the browser: they forbid
-# framing (the whole point of the proxy) or pin the page to its origin.
-STRIP_HEADERS = {
-    "x-frame-options",
-    "content-security-policy",
-    "content-security-policy-report-only",
-    "x-content-security-policy",
-    "x-webkit-csp",
-    "timing-allow-origin",
-    # Hop-by-hop headers (RFC 9110 §7.6.1): they describe this one
-    # connection, not the message, and must never be forwarded to the
-    # client. The worst of them is transfer-encoding: the origin
-    # sends chunked, the proxy rewrites the body (so aiohttp sets its
-    # own Content-Length), and a response carrying BOTH
-    # Content-Length and Transfer-Encoding is malformed — browsers
-    # reject it or wait forever for the chunked stream to end, so
-    # the iframe never fires load and the panel spins on
-    # "Loading…" forever (v0.2.0/0.2.1 bug, found by proxying
-    # google.com / youtube.com / facebook.com, all chunked).
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "te",
-    "trailer",
-    "trailers",
-    "proxy-connection",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "upgrade",
-    # content-encoding: aiohttp decodes the origin's gzip/deflate
-    # when it reads the body, so what the proxy returns is already
-    # plain — forwarding the origin's Content-Encoding header makes
-    # the client try to gunzip plain text ("Can not decode
-    # content-encoding: gzip") and the page never loads (v0.2.2
-    # bug, found by the live proxy test: every site failed this
-    # way, while a direct fetch of the same sites worked).
-    "content-encoding",
+_DROP_REQ = {
+    "host", "cookie", "origin", "referer", "content-length", "accept-encoding",
+    "connection", "keep-alive", "proxy-authorization", "proxy-authenticate",
+    "te", "trailer", "transfer-encoding", "upgrade", "forwarded", "via",
+    "x-real-ip",
 }
-
-# HTML void elements (no end tag, no children).
-VOID_ELEMENTS = {
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
-    "meta", "param", "source", "track", "wbr",
+_DROP_REQ_PREFIX = ("sec-fetch-", "sec-websocket-", "x-forwarded-", "x-ha-", "cf-")
+_PASS_RESP = {
+    "content-type", "cache-control", "etag", "last-modified", "expires",
+    "content-disposition", "content-range", "accept-ranges", "content-language",
+    "pragma",
 }
-
-# Attributes that carry a URL, per tag.
-URL_ATTRS = {
-    "a": ("href",),
-    "link": ("href",),
-    "img": ("src", "srcset"),
-    "script": ("src",),
-    "iframe": ("src",),
-    "form": ("action",),
-    "video": ("src", "poster"),
-    "audio": ("src",),
-    "source": ("src", "srcset"),
-    "embed": ("src",),
-    "object": ("data",),
-    "track": ("src",),
-    "blockquote": ("cite",),
-    "q": ("cite",),
-    "ins": ("cite",),
-    "del": ("cite",),
-}
+_HTML_TYPES = {"text/html", "application/xhtml+xml"}
+_BODYLESS = {204, 304}
 
 
-def host_of(url: str) -> str | None:
-    """Lowercased hostname of a URL, or None if it has none."""
-    try:
-        return (urlparse(url).hostname or "").lower() or None
-    except ValueError:
-        return None
-
-
-def _domain_match(host: str, domain: str) -> bool:
-    return host == domain or host.endswith("." + domain)
-
-
-def is_blocked_url(url: str) -> bool:
-    """True when a URL points at a known ad/tracker domain."""
-    host = host_of(url)
-    if not host:
-        return False
-    for domain in BLOCKED_DOMAINS:
-        if _domain_match(host, domain):
-            return True
-    pattern = PATH_BLOCKED_DOMAINS.get(host) or next(
-        (p for d, p in PATH_BLOCKED_DOMAINS.items() if _domain_match(host, d)),
-        None,
+def _page(status: int, title: str, detail: str) -> web.Response:
+    body = (
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+        f"<title>{html_lib.escape(title)}</title>"
+        "<style>body{font:16px system-ui,sans-serif;margin:12vh auto;max-width:34rem;"
+        "padding:0 1.5rem;color:#333}h1{font-size:1.4rem}code{background:#eee;"
+        "padding:.1em .3em;border-radius:3px;word-break:break-all}</style>"
+        f"<h1>{html_lib.escape(title)}</h1><p>{html_lib.escape(detail)}</p>"
     )
-    if pattern is not None:
-        try:
-            path = urlparse(url).path or ""
-        except ValueError:
-            path = ""
-        if pattern.search(path):
-            return True
-    return False
-
-
-def is_forbidden_target(url: str) -> bool:
-    """True for URLs the proxy must never fetch (SSRF guard).
-
-    Blocks non-http(s) schemes, localhost, loopback, link-local and
-    reserved addresses. Private LAN addresses (RFC1918) and `.local`
-    hosts are ALLOWED since v0.2.0: browsing internal resources
-    (router, NAS, Node-RED, dashboards) is the point of the browser,
-    and the proxy is admin-only behind signed HA URLs — the same
-    access control hass_ingress relies on. The terminal integration
-    already gives an admin a shell with full LAN access, so blocking
-    the LAN here would add no safety for this household.
-    """
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return True
-    if parsed.scheme not in ("http", "https", "ws", "wss"):
-        return True
-    host = (parsed.hostname or "").lower()
-    if not host or host in ("localhost",):
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return ip.is_loopback or ip.is_link_local or ip.is_reserved
-
-
-def is_internal_target(url: str) -> bool:
-    """True when a URL points at a LAN service (private IP / .local)."""
-    host = host_of(url) or ""
-    if host.endswith(".local"):
-        return True
-    try:
-        return ipaddress.ip_address(host).is_private
-    except ValueError:
-        return False
-
-
-def proxy_url_for(target: str, base_url: str | None = None, signer=None) -> str | None:
-    """Wrap a page-relative or absolute URL as a proxy URL.
-
-    Returns None when the URL is unusable (javascript:, mailto:,
-    fragment-only) or points at a blocked ad/tracker domain.
-
-    `signer`, when given, is a callable taking a proxy URL and
-    returning the same URL with a valid HA auth signature appended
-    (or None on failure). Signed URLs are required: the browser
-    panel and the proxied pages load through plain iframe
-    navigations, which carry no Authorization header, so an
-    unsigned proxy URL answers 401 (see views.py). A signer that
-    fails or returns None falls back to the unsigned URL.
-    """
-    if not target:
-        return None
-    target = target.strip()
-    if not target or target.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
-        return None
-    absolute = urljoin(base_url, target) if base_url else target
-    if is_blocked_url(absolute):
-        return None
-    url = f"{PROXY_PATH}?url={quote(absolute, safe='')}"
-    if signer is not None:
-        try:
-            signed = signer(url)
-        except Exception:
-            signed = None
-        if signed:
-            return signed
-    return url
-
-
-def proxy_url_for_srcset(srcset: str, base_url: str | None, signer=None) -> str:
-    """Rewrite every URL inside a srcset attribute through the proxy."""
-    parts = []
-    for chunk in srcset.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        bits = chunk.split()
-        proxied = proxy_url_for(bits[0], base_url, signer)
-        if proxied is None:
-            continue
-        parts.append(proxied + (" " + " ".join(bits[1:]) if len(bits) > 1 else ""))
-    return ", ".join(parts)
-
-
-def ws_relay_url_for(target: str, base_url: str | None = None, signer=None) -> str | None:
-    """Wrap a ws(s):// URL as a websocket-relay URL (unsigned unless signed).
-
-    Returns None for unusable URLs. The relay itself is a GET with an
-    Upgrade header, so a signed relay URL authenticates like any other
-    signed proxy URL — but the shim cannot sign synchronously, so it
-    asks the panel to sign (see _shim_script) instead of using this
-    for live pages. This helper is for tests and for any server-side
-    use; the live path goes through the panel.
-    """
-    if not target:
-        return None
-    target = target.strip()
-    if not target:
-        return None
-    if "://" in target:
-        absolute = target
-    else:
-        # Relative WS path: resolve against the base page with its
-        # scheme converted http->ws / https->wss.
-        try:
-            parsed_base = urlparse(base_url or "")
-        except ValueError:
-            return None
-        ws_scheme = {"http": "ws", "https": "wss"}.get(parsed_base.scheme)
-        if not ws_scheme:
-            return None
-        absolute = urljoin(parsed_base._replace(scheme=ws_scheme).geturl(), target)
-    try:
-        scheme = urlparse(absolute).scheme
-    except ValueError:
-        return None
-    if scheme not in ("ws", "wss"):
-        return None
-    if is_forbidden_target(absolute):
-        return None
-    url = f"{WS_RELAY_PATH}?url={quote(absolute, safe='')}"
-    if signer is not None:
-        try:
-            signed = signer(url)
-        except Exception:
-            signed = None
-        if signed:
-            return signed
-    return url
-
-
-def extract_ws_target(raw: str | None) -> str | None:
-    """Decode and validate the ?url= query value of a relay request."""
-    if not raw:
-        return None
-    try:
-        target = unquote(raw)
-    except Exception:
-        return None
-    try:
-        scheme = urlparse(target).scheme
-    except ValueError:
-        return None
-    if scheme not in ("ws", "wss"):
-        return None
-    if is_forbidden_target(target):
-        return None
-    return target
-    """Drop framing/CSP headers; keep everything else."""
-    return {k: v for k, v in headers.items() if k.lower() not in STRIP_HEADERS}
-
-
-_CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)([^)'\"]+)\1\s*\)", re.I)
-
-
-def strip_headers(headers) -> dict:
-    """Drop framing/CSP headers; keep everything else."""
-    return {k: v for k, v in headers.items() if k.lower() not in STRIP_HEADERS}
-
-
-def rewrite_css(css: str, base_url: str, signer=None) -> tuple[str, int]:
-    """Rewrite url(...) references in a stylesheet through the proxy.
-
-    Returns (rewritten_css, blocked_count).
-    """
-    blocked = 0
-
-    def _repl(match: re.Match) -> str:
-        nonlocal blocked
-        quote_char, raw = match.group(1), match.group(2)
-        proxied = proxy_url_for(raw, base_url, signer)
-        if proxied is None:
-            blocked += 1
-            return "url(about:blank)"
-        return f"url({quote_char}{proxied}{quote_char})"
-
-    return _CSS_URL_RE.sub(_repl, css), blocked
-
-
-def _shim_script(blocked_domains: frozenset, server_blocked: int, base_url: str) -> str:
-    """Client-side shim, injected into every proxied HTML page.
-
-    Three jobs, in order of importance for internal apps:
-    1. Route the page's own requests through the proxy. The page is
-       served from Home Assistant's origin, so a relative fetch/XHR/
-       WebSocket URL would otherwise hit Home Assistant itself
-       instead of the site it came from. Every such request is
-       resolved against the page's ORIGINAL base URL and routed
-       through the proxy — and because proxy URLs must be signed,
-       the shim asks the sidebar panel to sign them (the panel owns
-       the HA connection; the page cannot sign for itself). The panel
-       answers with ha-browser-signed / ha-browser-sign-error.
-    2. Block ads/trackers the page loads on its own (fetch/XHR/
-       dynamic tags) and report the running blocked count to the
-       browser bar.
-    3. Make XMLHttpRequest work through the proxy at all: the shim
-       replaces it with a fetch-backed implementation, because a
-       native XHR cannot wait for a signature. Async only — sync XHR
-       is deprecated and throws.
-    """
-    domains_json = json.dumps(sorted(blocked_domains))
-    base_json = json.dumps(base_url)
-    proxy_json = json.dumps(PROXY_PATH)
-    relay_json = json.dumps(WS_RELAY_PATH)
-    return (
-        "<script>(function(){"
-        "var BLOCKED=" + domains_json + ";"
-        "var BASE=" + base_json + ";"
-        "var PROXY=" + proxy_json + ";"
-        "var WSRELAY=" + relay_json + ";"
-        f"var count={server_blocked};"
-        # --- adblock helpers
-        "function blocked(u){try{var h=new URL(u,location.href).hostname.toLowerCase();"
-        "for(var i=0;i<BLOCKED.length;i++){if(h===BLOCKED[i]||h.endsWith('.'+BLOCKED[i]))return true;}"
-        "}catch(e){}return false;}"
-        "function report(){try{window.parent.postMessage({type:'ha-browser-blocked',count:count},location.origin);}catch(e){}}"
-        # --- signing: ask the sidebar panel (it owns the HA connection)
-        "var _seq=0;var _pending={};"
-        "function sign(path){return new Promise(function(res,rej){"
-        "if(window.parent===window){rej(new Error('no panel'));return;}"
-        "var id=++_seq;var done=false;"
-        "var timer=setTimeout(function(){if(!done){done=true;delete _pending[id];rej(new Error('sign timeout'));}},5000);"
-        "_pending[id]={res:function(v){if(!done){done=true;clearTimeout(timer);res(v);}},"
-        "rej:function(e){if(!done){done=true;clearTimeout(timer);rej(e);}}};"
-        "try{window.parent.postMessage({type:'ha-browser-sign',id:id,path:path},location.origin);}"
-        "catch(e){delete _pending[id];clearTimeout(timer);rej(e);}});}"
-        "window.addEventListener('message',function(ev){if(ev.origin!==location.origin)return;"
-        "var d=ev.data||{};"
-        "if(d.type==='ha-browser-signed'&&_pending[d.id])_pending[d.id].res(d.signed);"
-        "else if(d.type==='ha-browser-sign-error'&&_pending[d.id])_pending[d.id].rej(new Error('sign failed'));});"
-        # --- URL routing: proxy/HA URLs pass through, the rest resolve
-        # against the page's ORIGINAL base and go through the proxy.
-        "function isProxyPath(u){return typeof u==='string'&&(u.indexOf(PROXY)===0||u.indexOf(WSRELAY)===0);}"
-        "function resolve(u){if(isProxyPath(u))return u;"
-        "try{return new URL(u,BASE).href;}catch(e){return null;}}"
-        "function sameOrigin(u){try{return new URL(u,location.href).origin===location.origin;}catch(e){return false;}}"
-        "function proxyFor(abs){return PROXY+'?url='+encodeURIComponent(abs);}"
-        # --- fetch
-        "var ofetch=window.fetch.bind(window);"
-        "window.fetch=function(input,init){"
-        "var raw=typeof input==='string'?input:(input&&input.url);"
-        "var abs=resolve(raw);if(!abs)return ofetch.apply(null,arguments);"
-        "if(isProxyPath(abs)||sameOrigin(abs))return ofetch.apply(null,arguments);"
-        "if(blocked(abs)){count++;report();return Promise.reject(new Error('blocked by HA Browser'));}"
-        "return sign(proxyFor(abs)).then(function(signed){"
-        "if(typeof input==='string')return ofetch(signed,init);"
-        "try{return ofetch(new Request(signed,input));}catch(e){return ofetch(signed,init);}"
-        "}).catch(function(){return ofetch.apply(null,arguments);});};"
-        # --- XMLHttpRequest, fetch-backed so it can wait for a signature
-        "var NativeXHR=window.XMLHttpRequest;"
-        "function FakeXHR(){this._headers={};this.readyState=0;this.status=0;this.statusText='';"
-        "this.responseText='';this.response='';this.responseType='';this._aborted=false;"
-        "this.onreadystatechange=null;this.onload=null;this.onerror=null;this._listeners={};}"
-        "FakeXHR.prototype.open=function(method,url,async){"
-        "if(async===false)throw new Error('Synchronous XHR is not supported by HA Browser');"
-        "this._method=method;this._url=url;this.readyState=1;this._fire('readystatechange');};"
-        "FakeXHR.prototype.setRequestHeader=function(k,v){this._headers[k]=v;};"
-        "FakeXHR.prototype.getResponseHeader=function(){return null;};"
-        "FakeXHR.prototype.getAllResponseHeaders=function(){return '';};"
-        "FakeXHR.prototype.addEventListener=function(t,fn){(this._listeners[t]=this._listeners[t]||[]).push(fn);};"
-        "FakeXHR.prototype.removeEventListener=function(t,fn){var a=this._listeners[t]||[];var i=a.indexOf(fn);if(i>=0)a.splice(i,1);};"
-        "FakeXHR.prototype._fire=function(t,ev){var h=this['on'+t];"
-        "if(typeof h==='function'){try{h.call(this,ev||{});}catch(e){}}"
-        "var self=this;(this._listeners[t]||[]).forEach(function(fn){try{fn.call(self,ev||{});}catch(e){}});};"
-        "FakeXHR.prototype.abort=function(){this._aborted=true;this.readyState=0;};"
-        "FakeXHR.prototype.send=function(body){var self=this;"
-        "function fail(){if(self._aborted)return;self.readyState=4;self.status=0;"
-        "self._fire('readystatechange');self._fire('error');}"
-        "var abs=resolve(self._url);if(!abs){fail();return;}"
-        "if(isProxyPath(abs)||sameOrigin(abs)){doFetch(abs);return;}"
-        "if(blocked(abs)){count++;report();fail();return;}"
-        "sign(proxyFor(abs)).then(doFetch,function(){doFetch(abs);});"
-        "function doFetch(url){if(self._aborted)return;"
-        "var headers=new Headers();for(var k in self._headers)headers.append(k,self._headers[k]);"
-        "ofetch(url,{method:self._method,headers:headers,body:(body===undefined?null:body)}).then(function(resp){"
-        "if(self._aborted)return;self.status=resp.status;self.statusText=resp.statusText;"
-        "self.readyState=2;self._fire('readystatechange');"
-        "if(self.responseType==='json')return resp.text().then(function(t){try{return JSON.parse(t);}catch(e){return t;}});"
-        "return resp.text();}).then(function(data){if(self._aborted)return;"
-        "if(typeof data==='string'){self.responseText=data;self.response=data;}"
-        "else{self.response=data;self.responseText='';}"
-        "self.readyState=4;self._fire('readystatechange');self._fire('load');}).catch(fail);}};"
-        "window.XMLHttpRequest=FakeXHR;"
-        # --- WebSocket: deferred until the panel signs the relay URL
-        "var NativeWS=window.WebSocket;"
-        "function DeferredWS(url,protocols){var self=this;"
-        "this.url=url;this.protocol='';this._binaryType='blob';this.readyState=0;this.bufferedAmount=0;"
-        "this.onopen=null;this.onmessage=null;this.onclose=null;this.onerror=null;"
-        "this._listeners={};this._queue=[];this._real=null;this._closed=false;"
-        "var abs=resolve(url);"
-        "function fail(){self.readyState=3;self._fire('error',{});self._fire('close',{code:1006,wasClean:false});}"
-        "if(!abs){setTimeout(fail,0);return;}"
-        "if(blocked(abs)){count++;report();setTimeout(fail,0);return;}"
-        "if(isProxyPath(abs)||sameOrigin(abs)){connect(abs);return;}"
-        "sign(WSRELAY+'?url='+encodeURIComponent(abs)).then(connect,function(){fail();});"
-        "function connect(target){if(self._closed)return;var real;"
-        "try{real=new NativeWS(target,protocols);}catch(e){fail();return;}"
-        "self._real=real;try{real.binaryType=self.binaryType;}catch(e){}"
-        "real.onopen=function(ev){self.readyState=1;try{self.protocol=real.protocol||'';}catch(e){}"
-        "self._fire('open',ev);var q=self._queue;self._queue=[];"
-        "q.forEach(function(d){try{real.send(d);}catch(e){}});};"
-        "real.onmessage=function(ev){self._fire('message',ev);};"
-        "real.onclose=function(ev){self.readyState=3;self._fire('close',ev);};"
-        "real.onerror=function(ev){self._fire('error',ev);};}}"
-        "DeferredWS.prototype._fire=function(t,ev){var h=this['on'+t];"
-        "if(typeof h==='function'){try{h.call(this,ev||{});}catch(e){}}"
-        "var self=this;(this._listeners[t]||[]).forEach(function(fn){try{fn.call(self,ev||{});}catch(e){}});};"
-        "DeferredWS.prototype.send=function(data){"
-        "if(this.readyState===3)throw new Error('WebSocket is closed');"
-        "if(this._real&&this.readyState===1){this._real.send(data);return;}"
-        "this._queue.push(data);};"
-        "DeferredWS.prototype.close=function(code,reason){this._closed=true;"
-        "if(this._real){try{this._real.close(code,reason);}catch(e){}}"
-        "else{this.readyState=3;var self=this;"
-        "setTimeout(function(){self._fire('close',{code:code||1000,wasClean:true});},0);}};"
-        "DeferredWS.prototype.addEventListener=function(t,fn){(this._listeners[t]=this._listeners[t]||[]).push(fn);};"
-        "DeferredWS.prototype.removeEventListener=function(t,fn){var a=this._listeners[t]||[];var i=a.indexOf(fn);if(i>=0)a.splice(i,1);};"
-        "Object.defineProperty(DeferredWS.prototype,'binaryType',{"
-        "get:function(){return this._binaryType||'blob';},"
-        "set:function(v){this._binaryType=v;if(this._real){try{this._real.binaryType=v;}catch(e){}}},"
-        "configurable:true});"
-        "DeferredWS.CONNECTING=0;DeferredWS.OPEN=1;DeferredWS.CLOSING=2;DeferredWS.CLOSED=3;"
-        "DeferredWS.prototype.CONNECTING=0;DeferredWS.prototype.OPEN=1;"
-        "DeferredWS.prototype.CLOSING=2;DeferredWS.prototype.CLOSED=3;"
-        "window.WebSocket=DeferredWS;"
-        # --- dynamic tags: drop blocked ones as they appear
-        "var mo=new MutationObserver(function(){"
-        "document.querySelectorAll('img,script,iframe,link').forEach(function(el){"
-        "var s=el.src||el.href||'';if(s&&blocked(s)){count++;el.remove();}});});"
-        "mo.observe(document.documentElement,{childList:true,subtree:true});"
-        "report();"
-        "})();</script>"
+    return web.Response(
+        status=status, body=body.encode(), content_type="text/html",
+        charset="utf-8", headers=_OUR_HEADERS,
     )
 
 
-class _Rewriter(HTMLParser):
-    """Rewrite a page's URLs through the proxy and strip ads."""
+def _decode(body: bytes, ctype: str) -> str:
+    m = re.search(r"charset=([^\s;]+)", ctype, re.I)
+    enc = m[1].strip("\"'") if m else None
+    if not enc:
+        m2 = re.search(rb"<meta[^>]+charset=[\"']?([\w-]+)", body[:4096], re.I)
+        enc = m2[1].decode("ascii", "ignore") if m2 else "utf-8"
+    try:
+        return body.decode(enc)
+    except (LookupError, UnicodeDecodeError):
+        return body.decode("utf-8", "replace")
 
-    def __init__(self, base_url: str, signer=None):
-        super().__init__(convert_charrefs=False)
-        self.base_url = base_url
-        self.signer = signer
-        self.out: list[str] = []
-        self.blocked = 0
-        self._skip_depth = 0  # >0 while inside a removed element
 
-    def _sign(self, proxy_url: str) -> str:
-        """Append an HA auth signature to a proxy URL, or return it as-is."""
-        if self.signer is None:
-            return proxy_url
+def _close_code(code: int | None) -> int:
+    if code and (1000 <= code <= 1003 or 1007 <= code <= 1011 or 3000 <= code <= 4999):
+        return code
+    return 1000
+
+
+class BrowserProxyView(HomeAssistantView):
+    """/api/ha_browser/s/{token}/{scheme}/{authority}/{tail}"""
+
+    url = PROXY_BASE + "/{token}/{scheme}/{authority}/{tail:.*}"
+    extra_urls = [PROXY_BASE + "/{token}/{scheme}/{authority}"]
+    name = "api:ha_browser:proxy"
+    requires_auth = False  # token in the path authenticates
+    cors_allowed = False
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self.hass = hass
+
+    async def _handle(self, request: web.Request, token, scheme, authority, tail=""):
+        runtime = self.hass.data.get(DOMAIN, {}).get("runtime")
+        if runtime is None:
+            return _page(503, "HA Browser is not loaded", "Enable the integration and retry.")
+
+        # Never raise HTTPUnauthorized: HA would count it towards IP bans.
+        sess = runtime.manager.get(token)
+        user = await self.hass.auth.async_get_user(sess.user_id) if sess else None
+        if (
+            sess is None or user is None or not user.is_active
+            or (runtime.options[CONF_REQUIRE_ADMIN] and not user.is_admin)
+        ):
+            return _page(401, "Session expired", "Reload the HA Browser panel to start a new session.")
+
+        if request.method == "OPTIONS":
+            h = dict(_OUR_HEADERS)
+            h["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS"
+            h["Access-Control-Allow-Headers"] = request.headers.get(
+                "Access-Control-Request-Headers", "*"
+            )
+            h["Access-Control-Max-Age"] = "600"
+            return web.Response(status=204, headers=h)
+
+        if scheme not in ("http", "https") or "@" in authority:
+            return _page(400, "Bad address", "Only http:// and https:// addresses are supported.")
         try:
-            signed = self.signer(proxy_url)
-        except Exception:
-            signed = None
-        return signed or proxy_url
+            parts = urlsplit(f"//{authority}")
+            host, _port = parts.hostname, parts.port
+            if not host:
+                raise ValueError
+            runtime.manager.policy.check_host(host)
+        except ValueError:
+            return _page(400, "Bad address", f"Invalid host: {authority}")
+        except PolicyError as err:
+            return _page(403, "Blocked by HA Browser", f"{authority}: {err}")
 
-    # -- helpers ------------------------------------------------------
-    def _is_ad_element(self, attrs: dict) -> bool:
-        for key in ("id", "class"):
-            value = attrs.get(key, "")
-            if value and AD_ELEMENT_RE.search(value):
-                return True
-        return False
+        # Rebuild upstream URL from the raw request path so encoding is preserved.
+        raw_path, _, query = request.raw_path.partition("?")
+        segs = raw_path.split("/", 7)  # '', api, ha_browser, s, token, scheme, auth, rest
+        rest = segs[7] if len(segs) > 7 else ""
+        upstream = f"{scheme}://{authority}/{rest}"
+        if query:
+            upstream += "?" + query
+        try:
+            url = URL(upstream, encoded=True)
+        except ValueError:
+            return _page(400, "Bad address", "Could not parse URL.")
 
-    def _rewrite_attrs(self, tag: str, attrs: list[tuple[str, str | None]]) -> list[tuple[str, str | None]] | None:
-        out: list[tuple[str, str | None]] = []
-        for name, value in attrs:
-            if value is None:
-                out.append((name, None))
+        headers = {}
+        for k, v in request.headers.items():
+            lk = k.lower()
+            if lk in _DROP_REQ or lk.startswith(_DROP_REQ_PREFIX):
                 continue
-            if name in ("href", "src", "action", "poster", "data", "cite"):
-                proxied = proxy_url_for(value, self.base_url, self.signer)
-                if proxied is None:
-                    if tag in ("script", "iframe", "img", "link", "source", "video", "audio", "embed", "track", "object"):
-                        # Blocked resource: drop the whole tag. The
-                        # caller marks the tag for skipping.
-                        return None
-                    # A link/form pointing at a blocked host: still wrap
-                    # it in a proxy URL so the click goes through the
-                    # proxy (which answers the blocked page) instead of
-                    # navigating the iframe straight to the ad site.
-                    absolute = urljoin(self.base_url, value)
-                    if is_blocked_url(absolute):
-                        out.append((name, self._sign(
-                            f"{PROXY_PATH}?url={quote(absolute, safe='')}")))
-                    else:
-                        # javascript:/mailto:/#fragment — leave alone.
-                        out.append((name, value))
-                else:
-                    out.append((name, proxied))
-            elif name == "srcset":
-                rewritten = proxy_url_for_srcset(value, self.base_url, self.signer)
-                out.append((name, rewritten))
-            else:
-                out.append((name, value))
-        return out
+            headers[k] = v
+        headers["Referer"] = f"{scheme}://{authority}/"
+        if "Origin" in request.headers:
+            headers["Origin"] = f"{scheme}://{authority}"
 
-    # -- parser callbacks ---------------------------------------------
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if self._skip_depth > 0:
-            if tag not in VOID_ELEMENTS:
-                self._skip_depth += 1
-            return
-        attrs_d = dict(attrs)
-        if tag == "base":
-            return  # we rewrite every URL ourselves; a <base> would break that
-        if self._is_ad_element(attrs_d):
-            self.blocked += 1
-            if tag not in VOID_ELEMENTS:
-                self._skip_depth = 1
-            return
-        rewritten = self._rewrite_attrs(tag, attrs)
-        if rewritten is None:
-            self.blocked += 1
-            if tag not in VOID_ELEMENTS:
-                self._skip_depth = 1
-            return
-        self.out.append(self._render_tag(tag, rewritten, close=False))
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            return await self._proxy_ws(request, sess, url, scheme, authority, headers)
 
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if self._skip_depth > 0:
-            return
-        attrs_d = dict(attrs)
-        if tag == "base":
-            return
-        if self._is_ad_element(attrs_d):
-            self.blocked += 1
-            return
-        rewritten = self._rewrite_attrs(tag, attrs)
-        if rewritten is None:
-            self.blocked += 1
-            return
-        self.out.append(self._render_tag(tag, rewritten, close=True))
+        body = await request.read() if request.body_exists else None
+        try:
+            async with sess.http.request(
+                request.method, url, headers=headers, data=body or None,
+                allow_redirects=False,
+            ) as resp:
+                return await self._relay(request, resp, runtime, token, str(url))
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
+            _LOGGER.debug("Upstream error for %s: %s", url, err)
+            return _page(502, "Could not reach site", f"{authority}: {err}")
 
-    def handle_endtag(self, tag: str) -> None:
-        if self._skip_depth > 0:
-            self._skip_depth -= 1
-            return
-        self.out.append(f"</{tag}>")
+    get = post = put = patch = delete = head = options = _handle
 
-    def handle_data(self, data: str) -> None:
-        if self._skip_depth == 0:
-            self.out.append(data)
+    # ------------------------------------------------------------------
+    async def _relay(self, request, resp, runtime, token, doc_url):
+        prefix = f"{PROXY_BASE}/{token}"
+        rw = Rewriter(prefix, doc_url)
+        out = dict(_OUR_HEADERS)
+        for k, v in resp.headers.items():
+            if k.lower() in _PASS_RESP:
+                out[k] = v
+        loc = resp.headers.get("Location")
+        if loc:
+            out["Location"] = rw.proxify(loc)
 
-    def handle_comment(self, data: str) -> None:
-        if self._skip_depth == 0:
-            self.out.append(f"<!--{data}-->")
-
-    def handle_decl(self, decl: str) -> None:
-        if self._skip_depth == 0:
-            self.out.append(f"<!{decl}>")
-
-    def handle_pi(self, data: str) -> None:
-        if self._skip_depth == 0:
-            self.out.append(f"<?{data}>")
-
-    @staticmethod
-    def _render_tag(tag: str, attrs: list[tuple[str, str | None]], close: bool) -> str:
-        text = "".join(
-            f' {name}="{value}"' if value is not None else f" {name}"
-            for name, value in attrs
+        ctype = resp.headers.get("Content-Type", "")
+        mime = ctype.split(";")[0].strip().lower()
+        rewritable = (
+            (mime in _HTML_TYPES or mime == "text/css")
+            and request.method != "HEAD"
+            and resp.status not in _BODYLESS
         )
-        if tag in VOID_ELEMENTS:
-            return f"<{tag}{text}>"
-        return f"<{tag}{text}{' /' if close else ''}>"
 
+        chunks: list[bytes] = []
+        if rewritable:
+            size, overflow = 0, False
+            async for chunk in resp.content.iter_chunked(65536):
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_REWRITE_BYTES:
+                    overflow = True
+                    break
+            if not overflow:
+                text = _decode(b"".join(chunks), ctype)
+                if mime == "text/css":
+                    text = rw.css(text)
+                else:
+                    text = rw.html(text, runtime.shim_js, doc_url)
+                out.pop("ETag", None)
+                out["Content-Type"] = f"{mime}; charset=utf-8"
+                return web.Response(body=text.encode("utf-8"), status=resp.status, headers=out)
 
-def rewrite_html(html: str, base_url: str, signer=None) -> tuple[str, int]:
-    """Rewrite a page through the proxy and inject the adblock shim.
+        # Streaming passthrough.
+        if "Content-Encoding" not in resp.headers and "Content-Length" in resp.headers:
+            out["Content-Length"] = resp.headers["Content-Length"]
+        stream = web.StreamResponse(status=resp.status, headers=out)
+        await stream.prepare(request)
+        if request.method != "HEAD" and resp.status not in _BODYLESS:
+            try:
+                for chunk in chunks:
+                    await stream.write(chunk)
+                async for chunk in resp.content.iter_chunked(65536):
+                    await stream.write(chunk)
+            except (ConnectionResetError, aiohttp.ClientError):
+                pass
+        try:
+            await stream.write_eof()
+        except (ConnectionResetError, aiohttp.ClientError):
+            pass
+        return stream
 
-    Returns (rewritten_html, blocked_count) where blocked_count is the
-    number of resources/elements removed server-side.
-    """
-    parser = _Rewriter(base_url, signer)
-    try:
-        parser.feed(html)
-        parser.close()
-    except Exception:
-        # A malformed page must not kill the browser: fall back to the
-        # original HTML with only the shim injected.
-        return html + _shim_script(BLOCKED_DOMAINS, 0, base_url), 0
-    body = "".join(parser.out)
-    shim = _shim_script(BLOCKED_DOMAINS, parser.blocked, base_url)
-    if "</body>" in body.lower():
-        idx = body.lower().rindex("</body>")
-        body = body[:idx] + shim + body[idx:]
-    else:
-        body = body + shim
-    return body, parser.blocked
+    # ------------------------------------------------------------------
+    async def _proxy_ws(self, request, sess, url, scheme, authority, headers):
+        protocols = [
+            p.strip()
+            for p in request.headers.get("Sec-WebSocket-Protocol", "").split(",")
+            if p.strip()
+        ]
+        try:
+            upstream = await sess.http.ws_connect(
+                url, protocols=protocols, headers=headers,
+                origin=f"{scheme}://{authority}",
+                autoclose=False, autoping=False, max_msg_size=0,
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
+            return _page(502, "WebSocket failed", f"{authority}: {err}")
 
+        server = web.WebSocketResponse(
+            protocols=[upstream.protocol] if upstream.protocol else (),
+            autoclose=False, autoping=False, max_msg_size=0,
+        )
+        await server.prepare(request)
 
-def extract_target(raw: str | None) -> str | None:
-    """Decode and validate the ?url= query value of a proxy request."""
-    if not raw:
-        return None
-    try:
-        target = unquote(raw)
-    except Exception:
-        return None
-    try:
-        scheme = urlparse(target).scheme
-    except ValueError:
-        return None
-    if scheme not in ("http", "https"):
-        return None
-    if is_forbidden_target(target):
-        return None
-    return target
+        async def pump(src, dst):
+            async for msg in src:
+                if msg.type == WSMsgType.TEXT:
+                    await dst.send_str(msg.data)
+                elif msg.type == WSMsgType.BINARY:
+                    await dst.send_bytes(msg.data)
+                elif msg.type == WSMsgType.PING:
+                    await dst.ping(msg.data)
+                elif msg.type == WSMsgType.PONG:
+                    await dst.pong(msg.data)
+                else:
+                    break
+
+        tasks = [
+            asyncio.create_task(pump(server, upstream)),
+            asyncio.create_task(pump(upstream, server)),
+        ]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await upstream.close(code=_close_code(server.close_code))
+                await server.close(code=_close_code(upstream.close_code))
+            except Exception:  # noqa: BLE001 - best effort on teardown
+                pass
+        return server
