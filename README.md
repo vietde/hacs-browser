@@ -76,6 +76,19 @@ CPU/memory cost the way an add-on has.
 
 ## Status
 
+v0.2.1 — fixes the panel failing to load at all. Ngot's screenshot
+showed "Unable to load custom panel from …/api/ha_browser/assets/
+panel.js" and the URL answered 500. Root cause, from the HA log:
+Home Assistant's view dispatcher calls the handler as
+`handler(request, **request.match_info)`, so the `{filename}` path
+parameter arrives as a keyword argument — and `AssetView.get` only
+took `request`, so every load raised `TypeError: AssetView.get() got
+an unexpected keyword argument 'filename'`. The offline test missed
+it because it called the view directly instead of the way HA does.
+The terminal's asset view already had the right signature; this one
+did not. Live verification on Ngot's HA still pending after HACS
+update + restart.
+
 v0.2.0 — internal resources, ingress-style (the hass_ingress
 model). The proxy now allows private LAN addresses and `.local`
 hosts, and internal apps get a websocket relay plus their API calls

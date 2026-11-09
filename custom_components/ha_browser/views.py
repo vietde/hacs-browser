@@ -164,8 +164,19 @@ class AssetView(HomeAssistantView):
     name = "api:ha_browser:assets"
     requires_auth = False
 
-    async def get(self, request: web.Request) -> web.Response:
-        filename = request.match_info["filename"]
+    async def get(
+        self, request: web.Request, filename: str | None = None
+    ) -> web.Response:
+        # Home Assistant's view dispatcher calls the handler as
+        # handler(request, **request.match_info), so the {filename}
+        # path parameter arrives as a keyword argument — a get() that
+        # only takes `request` raises TypeError and the panel answers
+        # 500 (v0.2.0 bug, found from Ngot's screenshot + the HA log:
+        # "AssetView.get() got an unexpected keyword argument
+        # 'filename'"). Accept it here; fall back to match_info so
+        # direct calls (offline tests) still work.
+        if filename is None:
+            filename = request.match_info["filename"]
         path = FRONTEND_DIR / filename
         if path.suffix not in _ASSET_TYPES:
             return web.Response(status=404)

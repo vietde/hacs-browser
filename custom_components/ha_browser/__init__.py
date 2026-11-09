@@ -31,7 +31,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up HA Browser from a config entry."""
     session = async_create_clientsession(
         hass,
-        headers={"User-Agent": "HA-Browser/0.2.0 (Home Assistant)"},
+        headers={"User-Agent": "HA-Browser/0.2.1 (Home Assistant)"},
     )
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"session": session}
 
