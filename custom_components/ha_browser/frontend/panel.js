@@ -45,10 +45,65 @@ class HABrowserPanel extends HTMLElement {
     this._overlayRetry = null;
     this._progress = null;
     this._onMessage = this._onMessage.bind(this);
+    this._frameTimer = null;
+    this._reported = new Set();
+  }
+
+  // One-line stage reports to the server log, so a hang in the
+  // browser leaves a trace in Home Assistant's log (v0.2.2: the
+  // "Loading… forever" hang produced zero server-side lines, which
+  // is why it took a live proxy test to find). Same pattern as HA
+  // Terminal's client beacon. Fire-and-forget, once per stage.
+  report(stage) {
+    try {
+      if (this._reported.has(stage)) return;
+      this._reported.add(stage);
+      fetch("/api/ha_browser/client-log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stage: stage }),
+      }).catch(() => {});
+    } catch (e) { /* never break the panel for logging */ }
+  }
+
+  // A sign request that never answers must not hang the panel
+  // forever: the v0.2.0/0.2.1 hang never settled, so the iframe src
+  // was never set and the overlay spun with no error.
+  _signWithTimeout(path) {
+    return Promise.race([
+      this._sign(path),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error("sign-timeout")),
+          this._signTimeoutMs || HABrowserPanel.SIGN_TIMEOUT_MS
+        )
+      ),
+    ]);
+  }
+
+  _startFrameTimer(url) {
+    this._clearFrameTimer();
+    this._frameTimer = setTimeout(() => {
+      this.report("frame-timeout");
+      this._showOverlay(
+        "This page is taking too long to load. The site may be slow, " +
+        "or it may refuse to load through a proxy. Try again, or try " +
+        "another site.",
+        true
+      );
+    }, this._frameTimeoutMs || HABrowserPanel.FRAME_TIMEOUT_MS);
+  }
+
+  _clearFrameTimer() {
+    if (this._frameTimer) {
+      clearTimeout(this._frameTimer);
+      this._frameTimer = null;
+    }
   }
 
   set hass(hass) {
     this._hass = hass;
+    this.report("hass-set");
     if (!this._configLoaded) {
       this._loadConfig();
     }
@@ -224,6 +279,7 @@ class HABrowserPanel extends HTMLElement {
     // loading overlay never hides.
     frame.addEventListener("load", () => this._onFrameLoad());
     window.addEventListener("message", this._onMessage);
+    this.report("panel-connected");
 
     // The hass object may already have arrived (and finished loading
     // the config) before this element was connected — then go straight
@@ -239,6 +295,7 @@ class HABrowserPanel extends HTMLElement {
 
   disconnectedCallback() {
     window.removeEventListener("message", this._onMessage);
+    this._clearFrameTimer();
     this._frame = null;
   }
 
@@ -266,16 +323,30 @@ class HABrowserPanel extends HTMLElement {
       hass && hass.auth && hass.auth.data && hass.auth.data.access_token;
     if (!token) return;
     this._configLoading = true;
+    const ctrl = new AbortController();
+    const timer = setTimeout(
+      () => ctrl.abort(),
+      this._configTimeoutMs || HABrowserPanel.CONFIG_TIMEOUT_MS
+    );
     try {
       const resp = await fetch("/api/ha_browser/config", {
         headers: { Authorization: "Bearer " + token },
+        signal: ctrl.signal,
       });
       if (resp.ok) {
         const cfg = await resp.json();
         if (cfg.homepage) this._homepage = cfg.homepage;
         if (typeof cfg.adblock === "boolean") this._adblock = cfg.adblock;
       }
-    } catch (e) { /* fall back to defaults */ }
+      this.report("config-ok");
+    } catch (e) {
+      // Fall back to defaults (including the config fetch timing
+      // out — without a timeout the homepage never navigates and
+      // the panel sits on "Loading…" forever).
+      this.report("config-failed");
+    } finally {
+      clearTimeout(timer);
+    }
     this._configLoaded = true;
     this._configLoading = false;
     if (!this._navigated && this._frame) {
@@ -330,18 +401,32 @@ class HABrowserPanel extends HTMLElement {
     if (this._address) this._address.value = url;
     if (this._blockedPill) this._blockedPill.textContent = "\uD83D\uDEAB 0 blocked";
     this._showOverlay("Loading\u2026", false);
+    this._clearFrameTimer();
     try {
-      const signed = await this._sign(
+      const signed = await this._signWithTimeout(
         "/api/ha_browser/proxy?url=" + encodeURIComponent(url)
       );
+      this.report("sign-ok");
       this._frame.src = signed;
+      this._startFrameTimer(url);
     } catch (e) {
-      this._showOverlay(
-        "Could not open this page — Home Assistant did not sign the " +
-        "address. Close the Browser panel and open it again; if it " +
-        "keeps happening, restart Home Assistant.",
-        true
-      );
+      if (e && e.message === "sign-timeout") {
+        this.report("sign-timeout");
+        this._showOverlay(
+          "Home Assistant did not answer the sign request in time. " +
+          "Close the Browser panel and open it again; if it keeps " +
+          "happening, restart Home Assistant.",
+          true
+        );
+      } else {
+        this.report("sign-failed");
+        this._showOverlay(
+          "Could not open this page — Home Assistant did not sign the " +
+          "address. Close the Browser panel and open it again; if it " +
+          "keeps happening, restart Home Assistant.",
+          true
+        );
+      }
     }
   }
 
@@ -350,6 +435,8 @@ class HABrowserPanel extends HTMLElement {
   }
 
   _onFrameLoad() {
+    this._clearFrameTimer();
+    this.report("frame-load");
     this._hideOverlay();
     // Keep the address bar in sync with what the iframe shows (same
     // origin, so reading its location is allowed).
@@ -399,6 +486,13 @@ class HABrowserPanel extends HTMLElement {
     }
   }
 }
+
+// Timeouts (plain assignments, not static class fields, so older
+// WebViews stay happy). Tests shorten them to exercise the timeout
+// paths without waiting.
+HABrowserPanel.SIGN_TIMEOUT_MS = 10000;
+HABrowserPanel.FRAME_TIMEOUT_MS = 45000;
+HABrowserPanel.CONFIG_TIMEOUT_MS = 10000;
 
 // Guarded: HA loads this module with a plain <script type="module">
 // (no cache), so a panel re-created after a disconnect would inject

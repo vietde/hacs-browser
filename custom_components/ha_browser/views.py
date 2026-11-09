@@ -46,6 +46,7 @@ proxy still fails — that joins the honest limits in the README.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import timedelta
 from pathlib import Path
 
@@ -67,6 +68,8 @@ from .const import (
     DOMAIN,
 )
 from .proxy import PROXY_PATH, WS_RELAY_PATH
+
+_LOGGER = logging.getLogger(__name__)
 
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 
@@ -252,7 +255,26 @@ class ProxyView(HomeAssistantView):
                 # target: the browser's Authorization header (HA Bearer
                 # token) must stay inside Home Assistant. Per-target
                 # login headers are a separate, future option.
-                if k.lower() not in ("host", "content-length", "connection", "cookie", "authorization")
+                #
+                # Also never forward Accept-Encoding: the browser
+                # offers gzip/deflate/br, and aiohttp only
+                # auto-decompresses responses it negotiated itself —
+                # a forwarded Accept-Encoding makes the target answer
+                # with an encoding aiohttp then cannot decode
+                # ("Can not decode content-encoding: gzip" for
+                # DuckDuckGo, and Brotli outright), which fails the
+                # whole fetch. Letting aiohttp send its own
+                # Accept-Encoding gets a decodable response every
+                # time (v0.2.2 fix).
+                if k.lower()
+                not in (
+                    "host",
+                    "content-length",
+                    "connection",
+                    "cookie",
+                    "authorization",
+                    "accept-encoding",
+                )
             }
             async with session.request(
                 request.method,
@@ -271,6 +293,7 @@ class ProxyView(HomeAssistantView):
                 resp_headers = browser_proxy.strip_headers(resp.headers)
                 raw = await resp.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            _LOGGER.warning("HA Browser proxy failed for %s: %s", target, err)
             return web.Response(status=502, text=f"Could not load page: {err}")
         if len(raw) > browser_proxy.MAX_BODY_BYTES:
             return web.Response(status=502, text="Page too large to proxy")
@@ -318,6 +341,32 @@ class ProxyView(HomeAssistantView):
             content_type=content_type or "application/octet-stream",
             headers=headers,
         )
+
+
+class ClientLogView(HomeAssistantView):
+    """Receives one-line stage reports from the panel.
+
+    The panel runs in the user's browser, where a hang leaves no
+    trace server-side — the v0.2.0/0.2.1 "Loading… forever" hang
+    produced zero HA log lines, which is why it took a live proxy
+    test to find it. The panel POSTs its milestones (and its
+    timeouts) here so the next failure names its stage in the HA
+    log. Same pattern as HA Terminal's client-log view. No auth:
+    the payload is a single stage string, nothing sensitive.
+    """
+
+    url = "/api/ha_browser/client-log"
+    name = "api:ha_browser:client_log"
+    requires_auth = False
+
+    async def post(self, request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+            stage = str(data.get("stage", "unknown"))[:200]
+        except Exception:
+            stage = "unparsable"
+        _LOGGER.warning("HA Browser client: %s", stage)
+        return web.Response(status=200)
 
 
 class BrowserWebSocketView(HomeAssistantView):

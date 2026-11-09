@@ -31,9 +31,12 @@ CPU/memory cost the way an add-on has.
 
 - **Light browser, not a desktop browser.** JavaScript-heavy apps,
   sites that need a login and video streaming mostly do not work well
-  through a simple proxy. It is for reading pages, news and docs —
-  and for checking your own internal services, which get a websocket
-  relay and proxied API calls so live dashboards keep working.
+  through a simple proxy. The YouTube, Facebook and Google PAGES
+  load through it (verified against the real sites), but video
+  playback is partial: media over the 10 MB proxy cap fails, so long
+  or high-bitrate videos may not play. It is for reading pages, news
+  and docs — and for checking your own internal services, which get
+  a websocket relay and proxied API calls.
 - **No logins through the proxy.** Do not sign in to anything
   important in it — the browser has its own cookie jar, but login
   flows through a proxy are unreliable and the session is shared
@@ -76,7 +79,27 @@ CPU/memory cost the way an add-on has.
 
 ## Status
 
-v0.2.1 — fixes the panel failing to load at all. Ngot's screenshot
+v0.2.2 — fixes the panel hanging on "Loading…" forever. Ngot's
+screenshot showed the browser chrome loaded but DuckDuckGo never
+rendered, and the HA log had zero errors — the hang was silent.
+Three real proxy bugs, all found by running the real proxy against
+the real sites (a new live test does exactly that): (1) the proxy
+forwarded the origin's `Transfer-Encoding: chunked` while aiohttp
+set its own `Content-Length` for the rewritten body — a malformed
+response browsers reject or wait on forever; (2) it forwarded
+`Content-Encoding: gzip` with a body aiohttp had already decoded,
+so the client tried to gunzip plain text and the page never loaded;
+(3) it forwarded the browser's `Accept-Encoding`, which aiohttp
+cannot decode when it did not negotiate it itself. All three
+headers are now stripped. The panel also stops hanging silently:
+signing times out after 10 s, a page load after 45 s, the config
+fetch after 10 s — each shows a readable error with a retry button
+— and the panel reports its stages to the HA log (a client beacon,
+like HA Terminal's) so the next failure names its stage. The live
+test proves Google, YouTube and Facebook pages load through the
+proxy (DuckDuckGo's own block page loads too; it refuses this test
+machine's datacenter IP, not the proxy). Live verification on Ngot's
+HA still pending after HACS update + restart. Ngot's screenshot
 showed "Unable to load custom panel from …/api/ha_browser/assets/
 panel.js" and the URL answered 500. Root cause, from the HA log:
 Home Assistant's view dispatcher calls the handler as

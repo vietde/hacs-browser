@@ -216,6 +216,34 @@ STRIP_HEADERS = {
     "x-content-security-policy",
     "x-webkit-csp",
     "timing-allow-origin",
+    # Hop-by-hop headers (RFC 9110 §7.6.1): they describe this one
+    # connection, not the message, and must never be forwarded to the
+    # client. The worst of them is transfer-encoding: the origin
+    # sends chunked, the proxy rewrites the body (so aiohttp sets its
+    # own Content-Length), and a response carrying BOTH
+    # Content-Length and Transfer-Encoding is malformed — browsers
+    # reject it or wait forever for the chunked stream to end, so
+    # the iframe never fires load and the panel spins on
+    # "Loading…" forever (v0.2.0/0.2.1 bug, found by proxying
+    # google.com / youtube.com / facebook.com, all chunked).
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "trailers",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "upgrade",
+    # content-encoding: aiohttp decodes the origin's gzip/deflate
+    # when it reads the body, so what the proxy returns is already
+    # plain — forwarding the origin's Content-Encoding header makes
+    # the client try to gunzip plain text ("Can not decode
+    # content-encoding: gzip") and the page never loads (v0.2.2
+    # bug, found by the live proxy test: every site failed this
+    # way, while a direct fetch of the same sites worked).
+    "content-encoding",
 }
 
 # HTML void elements (no end tag, no children).
